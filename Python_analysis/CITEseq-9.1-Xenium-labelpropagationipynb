@@ -1,0 +1,159 @@
+import numpy as np
+import pandas as pd 
+import scanpy as sc
+import scipy
+from anndata import AnnData
+from abc import abstractmethod
+from sklearn.preprocessing import OneHotEncoder, LabelEncoder, label_binarize, StandardScaler
+from sklearn.model_selection import StratifiedShuffleSplit, StratifiedKFold, GridSearchCV
+from sklearn.metrics import f1_score, roc_auc_score, accuracy_score, precision_score, balanced_accuracy_score, confusion_matrix
+import matplotlib.pyplot as plt
+
+class BaseLabelPropagation:
+    """Class for performing label propagation
+
+    Parameters
+    W: ndarray
+        adjacency matrix to compute label propagation on
+    ----------
+
+    Returns
+    ----------
+    """
+    def __init__(self, W):
+        self.W_norm = self._normalize(W)
+        self.n_nodes = np.shape(W)[0]
+        self.indicator_labels = None
+        self.n_classes = None
+        self.labeled_mask = None
+        self.predictions = None
+
+    @staticmethod
+    @abstractmethod
+    def _normalize(W):
+        raise NotImplementedError("_normalize must be implemented")
+
+    @abstractmethod
+    def _propagate(self):
+        raise NotImplementedError("_propagate must be implemented")
+
+
+    def _encode(self, labels):
+        # Get the number of classes
+        classes = np.unique(labels)
+        classes = classes[classes != -1] #-1 are unlabeled nodes so we'll exclude them
+        self.n_classes = np.shape(classes)[0]
+        # One-hot encode labeled data instances and zero rows corresponding to unlabeled instances
+        unlabeled_mask = (labels == -1)
+        labels = labels.copy()
+        labels[unlabeled_mask] = 0
+        onehot_encoder = OneHotEncoder(sparse_output = False)
+        self.indicator_labels = labels.reshape(len(labels), 1)
+        self.indicator_labels = onehot_encoder.fit_transform(self.indicator_labels)
+        self.indicator_labels[unlabeled_mask, 0] = 0
+
+        self.labeled_mask = ~unlabeled_mask
+
+    def fit(self, labels, max_iter, tol):
+        """Fits semisupervised label propagation model
+
+        Parameters
+        labels: ndarray
+            labels for every node, where -1 indicates unlabeled nodes
+        max_iter: int (default = 10000)
+            maximum number of iterations before stopping prediction
+        tol: float (default = 1e-3)
+            float referring to the error tolerance between runs. If unchanging, stop prediction
+        """
+        self._encode(labels)
+
+        self.predictions = self.indicator_labels.copy()
+        prev_predictions = np.zeros((self.n_nodes, self.n_classes), dtype = float)
+
+        for i in range(max_iter):
+            # Stop iterations if the system is considered at a steady state
+            variation = np.abs(self.predictions - prev_predictions).sum().item()
+
+            if variation < tol:
+                print(f"The method stopped after {i} iterations, variation={variation:.4f}.")
+                break
+
+            prev_predictions = self.predictions
+            self._propagate()
+
+    def predict(self):
+        return self.predictions
+
+    def predict_labels(self):
+        """
+        Returns
+        predicted_labels: ndarray
+            array of predicted labels according to the maximum probability
+        predicted_scores: ndarray
+            array of probability scores with dimensions n x nclasses
+        uncertainty: ndarray
+            array 1 - max of predictions
+
+        ----------
+        """
+        predicted_labels = np.argmax(self.predictions, axis = 1)
+        predicted_scores = self.predictions
+        uncertainty = 1 - np.max(predicted_scores, 1)
+
+        return predicted_labels, predicted_scores, uncertainty
+
+class LabelPropagation(BaseLabelPropagation):
+    def __init__(self, W):
+        super().__init__(W)
+
+    @staticmethod
+    def _normalize(W):
+        """ Computes row normalized adjacency matrix: D^-1 * W"""
+        d = W.sum(axis=0).getA1()
+        d = 1/d
+        D = scipy.sparse.diags(d)
+
+        return D @ W
+
+    def _propagate(self):
+        self.predictions = self.W_norm @ self.predictions
+
+        # Put back already known labels
+        self.predictions[self.labeled_mask] = self.indicator_labels[self.labeled_mask]
+
+    def fit(self, labels, max_iter = 10000, tol = 1e-3):
+        super().fit(labels, max_iter, tol)
+
+def plot_confusion_matrix_imshow(cm, class_names, figsize=(8, 8), fontsize = 12, normalize=True, title='Confusion Matrix', cmap='Purples',  filename_save = 'confusion_matrix'):
+    plt.figure(figsize=figsize)
+    
+    if normalize:
+        cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        cm_normalized = np.nan_to_num(cm_normalized)
+        cm_to_display = cm_normalized
+        fmt = '.2f'
+    else:
+        cm_to_display = cm
+        fmt = 'd'
+    
+    im = plt.imshow(cm_to_display, interpolation='nearest', cmap=plt.get_cmap(cmap), vmin=0, vmax=1 if normalize else cm.max())
+    plt.title(title, fontsize = fontsize+2)
+    plt.colorbar(im, shrink=0.77, aspect=25, pad=0.02)
+    
+    tick_marks_x = np.arange(len(class_names))
+    tick_marks_y = np.arange(len(class_names))
+    plt.xticks(tick_marks_x, class_names, rotation=90)
+    plt.yticks(tick_marks_y, class_names)
+    plt.tick_params(labelsize=fontsize)
+    
+    thresh = cm_to_display.max() / 2.
+    for i in range(cm_to_display.shape[0]):
+        for j in range(cm_to_display.shape[1]):
+            plt.text(j, i, format(cm_to_display[i, j], fmt),
+                     ha="center", va="center",
+                     color="white" if cm_to_display[i, j] > thresh else "black")
+    
+    plt.ylabel('True labels', fontsize = fontsize+2)
+    plt.xlabel('Predicted labels', fontsize = fontsize+2)
+    plt.tight_layout()
+    plt.savefig(filename_save+'.pdf', bbox_inches = 'tight')
